@@ -129,7 +129,7 @@ stages:
           - task: AzureCLI@2
             displayName: Build and Push Images to ACR
             inputs:
-              azureSubscription: 'azure-observability-connection'
+              azureSubscription: 'observability-connection'
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
@@ -173,7 +173,7 @@ stages:
                 - task: AzureCLI@2
                   displayName: Deploy to AKS
                   inputs:
-                    azureSubscription: 'azure-observability-connection'
+                    azureSubscription: 'observability-connection'
                     scriptType: bash
                     scriptLocation: inlineScript
                     inlineScript: |
