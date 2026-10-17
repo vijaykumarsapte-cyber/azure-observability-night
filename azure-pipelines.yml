@@ -1,150 +1,230 @@
-# Run from Azure DevOps only when manually queued.
-trigger: none
-pr: none
+
+# Azure 3-Tier Application CI/CD Pipeline
+# Automatic trigger on relevant changes to main
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 3-Tier-Application/**
+      - azure-pipelines.yml
+      - '*.tf'
+      - '*.tfvars'
+
+pr:
+  branches:
+    include:
+      - main
 
 pool:
   vmImage: ubuntu-latest
 
 variables:
-  # Replace azureServiceConnection with the exact ARM service connection name.
-  # Keep credentials in the service connection / secret variable group, not YAML.
+  # Set this to your Azure DevOps ARM service connection name.
   azureServiceConnection: ''
+
   resourceGroup: 'observability-rg-dev'
   aksCluster: 'observability-aks'
   acrName: 'observabilityacrwestusnodjs'
   keyVaultName: 'keyvaultobservabilitydev'
-  # The existing AKS kubelet user-assigned identity client ID (Terraform output).
+
+  # Set the existing AKS identity client ID if required by your manifests.
   keyVaultIdentityClientId: ''
-  imageTag: '$(Build.SourceVersion)'
+
+  imageTag: '$(Build.BuildId)'
 
 stages:
+  # --------------------------------------------------
+  # Stage 1: Validate application and infrastructure
+  # --------------------------------------------------
   - stage: Validate
-    displayName: Validate application, Terraform, and Kubernetes manifests
+    displayName: Validate Application and Infrastructure
     jobs:
       - job: Validate
+        displayName: Validate Project
         steps:
           - checkout: self
 
           - task: NodeTool@0
+            displayName: Install Node.js
             inputs:
               versionSpec: '20.x'
-            displayName: Use Node.js
-
-          - script: |
-              npm install --no-audit --no-fund
-              npm test
-            workingDirectory: 3-Tier-Application/Docker/frontend
-            displayName: Validate frontend
-
-          - task: GoTool@0
-            inputs:
-              version: '1.23.x'
-            displayName: Use Go 1.23
-
-          - script: go test ./...
-            workingDirectory: 3-Tier-Application/Docker/backend
-            displayName: Test backend
 
           - bash: |
               set -euo pipefail
+              npm install --no-audit --no-fund
+              npm test
+            displayName: Test Frontend
+            workingDirectory: 3-Tier-Application/Docker/frontend
+
+          - task: GoTool@0
+            displayName: Install Go
+            inputs:
+              version: '1.23.x'
+
+          - bash: |
+              set -euo pipefail
+              go test ./...
+            displayName: Test Backend
+            workingDirectory: 3-Tier-Application/Docker/backend
+
+          - bash: |
+              set -euo pipefail
+
               TERRAFORM_VERSION="1.5.7"
               case "$(uname -m)" in
                 x86_64) TERRAFORM_ARCH="amd64" ;;
                 aarch64|arm64) TERRAFORM_ARCH="arm64" ;;
-                *) echo "Unsupported agent architecture: $(uname -m)" >&2; exit 1 ;;
+                *) echo "Unsupported architecture"; exit 1 ;;
               esac
-              INSTALL_DIR="$(mktemp -d "${AGENT_TEMPDIRECTORY}/terraform.XXXXXX")"
-              ARCHIVE="terraform_${TERRAFORM_VERSION}_linux_${TERRAFORM_ARCH}.zip"
-              RELEASE_URL="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
-              curl -fsSLo "${INSTALL_DIR}/${ARCHIVE}" "${RELEASE_URL}/${ARCHIVE}"
-              curl -fsSLo "${INSTALL_DIR}/SHA256SUMS" "${RELEASE_URL}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
-              (cd "$INSTALL_DIR" && grep " ${ARCHIVE}$" SHA256SUMS | sha256sum --check --status)
-              unzip -oq "${INSTALL_DIR}/${ARCHIVE}" -d "$INSTALL_DIR"
-              echo "##vso[task.prependpath]${INSTALL_DIR}"
-              "${INSTALL_DIR}/terraform" version
-            displayName: Install Terraform 1.5.7
 
-          - script: |
+              INSTALL_DIR="$(mktemp -d)"
+              ARCHIVE="terraform_${TERRAFORM_VERSION}_linux_${TERRAFORM_ARCH}.zip"
+              URL="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
+
+              curl -fsSLo "$INSTALL_DIR/$ARCHIVE" "$URL/$ARCHIVE"
+              curl -fsSLo "$INSTALL_DIR/SHA256SUMS" \
+                "$URL/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+
+              (cd "$INSTALL_DIR" && grep " ${ARCHIVE}$" SHA256SUMS | sha256sum --check --status)
+              unzip -oq "$INSTALL_DIR/$ARCHIVE" -d "$INSTALL_DIR"
+
+              echo "##vso[task.prependpath]$INSTALL_DIR"
+              "$INSTALL_DIR/terraform" version
+            displayName: Install Terraform
+
+          # Change this directory if your Terraform files are in a subfolder.
+          - bash: |
+              set -euo pipefail
               terraform fmt -check -recursive
               terraform init -backend=false -input=false
               terraform validate
+            displayName: Validate Terraform
             workingDirectory: .
-            displayName: Validate Terraform (no apply)
 
           - task: UsePythonVersion@0
+            displayName: Install Python
             inputs:
               versionSpec: '3.x'
-            displayName: Use Python for manifest validation
 
-          - script: |
+          - bash: |
+              set -euo pipefail
               python -m pip install --disable-pip-version-check PyYAML==6.0.2
-              python -c "import glob,yaml; files=glob.glob('3-Tier-Application/k8s/**/*.yaml', recursive=True); [list(yaml.safe_load_all(open(f, encoding='utf-8'))) for f in files]; print(f'Validated YAML syntax in {len(files)} Kubernetes manifests')"
-            displayName: Check Kubernetes manifest syntax
+              python -c "import glob,yaml; files=glob.glob('3-Tier-Application/k8s/**/*.yaml', recursive=True) + glob.glob('3-Tier-Application/k8s/**/*.yml', recursive=True); [list(yaml.safe_load_all(open(f, encoding='utf-8'))) for f in files]; print('Validated', len(files), 'Kubernetes YAML files')"
+            displayName: Validate Kubernetes YAML
 
+  # --------------------------------------------------
+  # Stage 2: Build Docker images and push to ACR
+  # --------------------------------------------------
   - stage: BuildAndPush
-    displayName: Build and push frontend and backend to ACR
+    displayName: Build and Push Docker Images
     dependsOn: Validate
+    condition: succeeded()
     jobs:
       - job: BuildAndPush
+        displayName: Build Frontend and Backend
         steps:
           - checkout: self
+
           - task: AzureCLI@2
-            displayName: Authenticate and push images to ACR
+            displayName: Build and Push Images to ACR
             inputs:
               azureSubscription: $(azureServiceConnection)
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
+
                 registry="${ACR_NAME}.azurecr.io"
+
                 az acr login --name "$ACR_NAME"
-                docker build --pull -t "$registry/observability-frontend:$IMAGE_TAG" 3-Tier-Application/Docker/frontend
-                docker build --pull -t "$registry/observability-backend:$IMAGE_TAG" 3-Tier-Application/Docker/backend
+
+                docker build --pull \
+                  -t "$registry/observability-frontend:$IMAGE_TAG" \
+                  3-Tier-Application/Docker/frontend
+
+                docker build --pull \
+                  -t "$registry/observability-backend:$IMAGE_TAG" \
+                  3-Tier-Application/Docker/backend
+
                 docker push "$registry/observability-frontend:$IMAGE_TAG"
                 docker push "$registry/observability-backend:$IMAGE_TAG"
             env:
               ACR_NAME: $(acrName)
               IMAGE_TAG: $(imageTag)
 
+  # --------------------------------------------------
+  # Stage 3: Deploy application to existing AKS
+  # --------------------------------------------------
   - stage: Deploy
-    displayName: Deploy frontend and backend to existing AKS
+    displayName: Deploy Application to AKS
     dependsOn: BuildAndPush
+    condition: succeeded()
     jobs:
       - deployment: DeployApplication
+        displayName: Deploy Frontend and Backend
         environment: existing-aks
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
+
                 - task: AzureCLI@2
-                  displayName: Apply application manifests and roll out images
+                  displayName: Deploy to AKS
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: bash
                     scriptLocation: inlineScript
                     inlineScript: |
                       set -euo pipefail
+
                       if [[ -z "$CSI_IDENTITY_CLIENT_ID" ]]; then
-                        echo "Set pipeline variable keyVaultIdentityClientId to the existing AKS kubelet identity client ID."
+                        echo "Configure keyVaultIdentityClientId before deployment."
                         exit 2
                       fi
-                      az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
+
+                      az aks get-credentials \
+                        --resource-group "$RESOURCE_GROUP" \
+                        --name "$AKS_CLUSTER" \
+                        --overwrite-existing
+
                       kubectl apply -f 3-Tier-Application/k8s/namespaces.yaml
-                      TENANT_ID="$(az account show --query tenantId --output tsv)"
-                      export KEYVAULT_NAME TENANT_ID CSI_IDENTITY_CLIENT_ID
-                      envsubst < 3-Tier-Application/k8s/backend/db-password-secret.yaml | kubectl apply -f -
+
+                      TENANT_ID="$(az account show --query tenantId -o tsv)"
+                      export KEYVAULT_NAME TENANT_ID
+                      export CSI_IDENTITY_CLIENT_ID
+
+                      envsubst < \
+                        3-Tier-Application/k8s/backend/db-password-secret.yaml \
+                        | kubectl apply -f -
+
                       kubectl apply -f 3-Tier-Application/k8s/backend/configmap.yaml
                       kubectl apply -f 3-Tier-Application/k8s/backend/service.yaml
                       kubectl apply -f 3-Tier-Application/k8s/frontend/configmap.yaml
                       kubectl apply -f 3-Tier-Application/k8s/frontend/service.yaml
+
                       registry="${ACR_NAME}.azurecr.io"
+
                       kubectl apply -f 3-Tier-Application/k8s/backend/deployment.yaml
                       kubectl apply -f 3-Tier-Application/k8s/frontend/deployment.yaml
-                      kubectl set image deployment/backend backend="$registry/observability-backend:$IMAGE_TAG" -n backend
-                      kubectl set image deployment/frontend frontend="$registry/observability-frontend:$IMAGE_TAG" -n frontend
-                      kubectl rollout status deployment/backend -n backend --timeout=180s
-                      kubectl rollout status deployment/frontend -n frontend --timeout=180s
+
+                      kubectl set image deployment/backend \
+                        backend="$registry/observability-backend:$IMAGE_TAG" \
+                        -n backend
+
+                      kubectl set image deployment/frontend \
+                        frontend="$registry/observability-frontend:$IMAGE_TAG" \
+                        -n frontend
+
+                      kubectl rollout status deployment/backend \
+                        -n backend --timeout=180s
+
+                      kubectl rollout status deployment/frontend \
+                        -n frontend --timeout=180s
+
                       kubectl get services -n frontend
                       kubectl get services -n backend
                   env:
