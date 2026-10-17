@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: backend
+data:
+  PORT: "8080"
+  DB_USERNAME: "postgres"
+  DB_HOST: "postgres.database.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "goalsdb"
+  SSL: "disable"
