@@ -45,10 +45,24 @@ stages:
             workingDirectory: 3-Tier-Application/Docker/backend
             displayName: Test backend
 
-          - task: TerraformInstaller@1
-            inputs:
-              terraformVersion: '1.5.7'
-            displayName: Install Terraform
+          - bash: |
+              set -euo pipefail
+              TERRAFORM_VERSION="1.5.7"
+              case "$(uname -m)" in
+                x86_64) TERRAFORM_ARCH="amd64" ;;
+                aarch64|arm64) TERRAFORM_ARCH="arm64" ;;
+                *) echo "Unsupported agent architecture: $(uname -m)" >&2; exit 1 ;;
+              esac
+              INSTALL_DIR="$(mktemp -d "${AGENT_TEMPDIRECTORY}/terraform.XXXXXX")"
+              ARCHIVE="terraform_${TERRAFORM_VERSION}_linux_${TERRAFORM_ARCH}.zip"
+              RELEASE_URL="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
+              curl -fsSLo "${INSTALL_DIR}/${ARCHIVE}" "${RELEASE_URL}/${ARCHIVE}"
+              curl -fsSLo "${INSTALL_DIR}/SHA256SUMS" "${RELEASE_URL}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+              (cd "$INSTALL_DIR" && grep " ${ARCHIVE}$" SHA256SUMS | sha256sum --check --status)
+              unzip -oq "${INSTALL_DIR}/${ARCHIVE}" -d "$INSTALL_DIR"
+              echo "##vso[task.prependpath]${INSTALL_DIR}"
+              "${INSTALL_DIR}/terraform" version
+            displayName: Install Terraform 1.5.7
 
           - script: |
               terraform fmt -check -recursive
